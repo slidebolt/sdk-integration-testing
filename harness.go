@@ -132,6 +132,9 @@ func buildPlugin(t *testing.T, module, srcDir string) (string, error) {
 // from inside the plugin's own test files.
 func New(t *testing.T, pluginModule, pluginDir string) *Suite {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration stack bootstrap in short mode")
+	}
 
 	buildInfra(t)
 	if infraErr != nil {

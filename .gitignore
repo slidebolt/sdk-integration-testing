@@ -1,0 +1,7 @@
+.build/
+*.exe
+*.test
+*.out
+vendor/
+
+scripts/.release_guard

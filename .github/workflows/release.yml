@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_guard:
+        description: "Guard token. Use scripts/release-safe.sh"
+        required: true
+        type: string
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options: [patch, minor, major]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Enforce release guard
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          expected_sha256="aa7e759ce4be39c01631a26583b6df6546531a4b5047ce75f501f82f7fd729e8"
+          provided_sha256="$(printf '%s' "${{ github.event.inputs.release_guard }}" | sha256sum | awk '{print $1}')"
+          if [ "$provided_sha256" != "$expected_sha256" ]; then
+            echo "BLOCKED: run scripts/release-safe.sh"
+            exit 1
+          fi
+          echo "PASS: release guard validated"
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Bump version
+        id: version
+        run: |
+          CURRENT=$(git tag --sort=-version:refname | grep '^v' | head -1)
+          CURRENT=${CURRENT:-v0.0.0}
+          MAJOR=$(echo $CURRENT | cut -d. -f1 | tr -d 'v')
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+          echo "version=v${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
+
+      - name: Tag and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.version }}
+          git push origin ${{ steps.version.outputs.version }}
+
+      - name: Create GitHub release
+        run: gh release create ${{ steps.version.outputs.version }} --title ${{ steps.version.outputs.version }} --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

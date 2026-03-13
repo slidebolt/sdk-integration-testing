@@ -31,6 +31,8 @@ import (
 	"github.com/slidebolt/sdk-types"
 )
 
+const internalHealthRoute = "/_internal/health"
+
 // Suite manages a running Slidebolt stack for one test.
 type Suite struct {
 	t       *testing.T
@@ -354,7 +356,7 @@ func (s *Suite) isRegistered(id string) bool {
 
 func (s *Suite) isHealthy(id string) bool {
 	client := http.Client{Timeout: 300 * time.Millisecond}
-	resp, err := client.Get(s.apiURL + types.RPCMethodHealthCheck + "?id=" + id)
+	resp, err := client.Get(s.apiURL + internalHealthRoute + "?id=" + id)
 	if err != nil {
 		return false
 	}

@@ -15,7 +15,7 @@ if [[ "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
 fi
 
 if [[ -z "${RELEASE_GUARD:-}" && -f "$GUARD_FILE" ]]; then
-  RELEASE_GUARD="$(tr -d '\\n' < "$GUARD_FILE")"
+  RELEASE_GUARD="$(tr -d '\n' < "$GUARD_FILE")"
 fi
 
 if [[ -z "${RELEASE_GUARD:-}" ]]; then

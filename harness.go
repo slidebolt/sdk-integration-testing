@@ -16,6 +16,7 @@
 package integrationtesting
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -188,6 +189,79 @@ func New(t *testing.T, pluginModule, pluginDir string) *Suite {
 	return s
 }
 
+// PluginSpec identifies a plugin binary to build and include in a multi-plugin stack.
+type PluginSpec struct {
+	Module string // Go module path, e.g. "github.com/slidebolt/plugin-test-clean"
+	Dir    string // Directory containing go.mod; pass "." from inside the plugin directory
+}
+
+// NewMulti is like New but boots multiple plugins in the same stack.
+// primary is the main plugin under test; extras are additional plugins to co-start.
+// The launcher auto-discovers all binaries whose names start with "plugin-".
+func NewMulti(t *testing.T, primary PluginSpec, extras ...PluginSpec) *Suite {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration stack bootstrap in short mode")
+	}
+
+	buildInfra(t)
+	if infraErr != nil {
+		t.Fatalf("integrationtesting: %v", infraErr)
+	}
+
+	allSpecs := append([]PluginSpec{primary}, extras...)
+	builtBins := make([]string, 0, len(allSpecs))
+	for _, spec := range allSpecs {
+		bin, err := buildPlugin(t, spec.Module, spec.Dir)
+		if err != nil {
+			t.Fatalf("integrationtesting: %v", err)
+		}
+		builtBins = append(builtBins, bin)
+	}
+
+	dir, err := os.MkdirTemp("", "sdk-integration-testing-run-*")
+	if err != nil {
+		t.Fatalf("integrationtesting: create run dir: %v", err)
+	}
+
+	binDir := filepath.Join(dir, ".build", "bin")
+	for _, sub := range []string{
+		binDir,
+		filepath.Join(dir, ".build", "pids"),
+		filepath.Join(dir, ".build", "logs"),
+		filepath.Join(dir, ".build", "data"),
+	} {
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatalf("integrationtesting: mkdir: %v", err)
+		}
+	}
+
+	copyBin(t, infraGW, filepath.Join(binDir, "gateway"))
+	for i, spec := range allSpecs {
+		copyBin(t, builtBins[i], filepath.Join(binDir, filepath.Base(spec.Module)))
+	}
+	writeManifest(t, dir, "gateway")
+
+	env := filterEnv(os.Environ(), func(k string) bool {
+		return !strings.HasPrefix(k, "LAUNCHER_")
+	})
+	env = append(env,
+		"LAUNCHER_PREBUILT=true",
+		"LAUNCHER_API_PORT=0",
+		"LAUNCHER_NATS_PORT=0",
+		"LAUNCHER_BUILD_DIR="+filepath.Join(dir, ".build"),
+	)
+
+	logDir := filepath.Join(dir, ".build", "logs")
+	s := &Suite{t: t, dir: dir, logDir: logDir, env: env}
+	s.start()
+	s.waitForRuntime()
+
+	t.Cleanup(s.Stop)
+	return s
+}
+
+
 func (s *Suite) start() {
 	logFile, err := os.Create(filepath.Join(s.dir, "launcher.log"))
 	if err != nil {
@@ -332,6 +406,43 @@ func (s *Suite) GetJSON(path string, v any) error {
 		return fmt.Errorf("GET %s: status %d: %s", path, status, body)
 	}
 	return json.Unmarshal(body, v)
+}
+
+// PostJSON performs a POST with a JSON body and optionally JSON-decodes the response into v.
+// Pass nil for v to ignore the response body.
+func (s *Suite) PostJSON(path string, body any, v any) error {
+	return s.doJSON(http.MethodPost, path, body, v)
+}
+
+// PatchJSON performs a PATCH with a JSON body and optionally JSON-decodes the response into v.
+// Pass nil for v to ignore the response body.
+func (s *Suite) PatchJSON(path string, body any, v any) error {
+	return s.doJSON(http.MethodPatch, path, body, v)
+}
+
+func (s *Suite) doJSON(method, path string, reqBody any, v any) error {
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("%s %s: marshal: %w", method, path, err)
+	}
+	req, err := http.NewRequest(method, s.apiURL+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("%s %s: status %d: %s", method, path, resp.StatusCode, respBody)
+	}
+	if v != nil {
+		return json.Unmarshal(respBody, v)
+	}
+	return nil
 }
 
 // WaitFor polls cond at 100ms intervals until it returns true or timeout elapses.

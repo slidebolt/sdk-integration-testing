@@ -16,14 +16,18 @@
 package integrationtesting
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,12 +70,15 @@ var (
 
 	pluginMu   sync.Mutex
 	pluginBins = map[string]string{} // module path → binary path
+
+	globalSuiteMu sync.Mutex
+	globalSuite   *Suite
 )
 
-func buildInfra(t *testing.T) {
-	t.Helper()
+// buildInfraE builds gateway and launcher binaries once per process.
+// Safe to call from both test and non-test contexts.
+func buildInfraE() error {
 	infraOnce.Do(func() {
-		// Makefile can pre-build these and export the paths to skip compilation.
 		if gw := firstEnv("SDK_INTEGRATION_TESTING_GATEWAY_BIN", "PLUGINHARNESS_GATEWAY_BIN"); gw != "" {
 			if lc := firstEnv("SDK_INTEGRATION_TESTING_LAUNCHER_BIN", "PLUGINHARNESS_LAUNCHER_BIN"); lc != "" {
 				infraGW, infraLC = gw, lc
@@ -96,10 +103,18 @@ func buildInfra(t *testing.T) {
 		}
 		infraGW, infraLC = gw, lc
 	})
+	return infraErr
 }
 
-func buildPlugin(t *testing.T, module, srcDir string) (string, error) {
+func buildInfra(t *testing.T) {
 	t.Helper()
+	if err := buildInfraE(); err != nil {
+		t.Fatalf("integrationtesting: %v", err)
+	}
+}
+
+// buildPluginE builds a plugin binary once per process, returning the path or an error.
+func buildPluginE(module, srcDir string) (string, error) {
 	pluginMu.Lock()
 	if bin, ok := pluginBins[module]; ok {
 		pluginMu.Unlock()
@@ -122,7 +137,27 @@ func buildPlugin(t *testing.T, module, srcDir string) (string, error) {
 	return bin, nil
 }
 
+func buildPlugin(t *testing.T, module, srcDir string) (string, error) {
+	t.Helper()
+	return buildPluginE(module, srcDir)
+}
+
 // --- New / Stop ---
+
+// withT returns a lightweight view of this suite bound to a different *testing.T.
+// The view does NOT own the stack — Stop() is a no-op and no t.Cleanup is registered.
+// Used by New() when RunAll has already started a shared stack.
+func (s *Suite) withT(t *testing.T) *Suite {
+	return &Suite{
+		t:       t,
+		dir:     s.dir,
+		logDir:  s.logDir,
+		apiURL:  s.apiURL,
+		natsURL: s.natsURL,
+		env:     s.env,
+		// cmd intentionally nil: Stop() on a view is a no-op.
+	}
+}
 
 // New builds all required binaries (once per test binary run), boots a full
 // Slidebolt stack, and blocks until the gateway writes runtime.json.
@@ -131,10 +166,24 @@ func buildPlugin(t *testing.T, module, srcDir string) (string, error) {
 // pluginModule is the Go module path, e.g. "github.com/slidebolt/plugin-test-clean".
 // pluginDir is the directory containing the plugin's go.mod; pass "." when calling
 // from inside the plugin's own test files.
+//
+// When called inside a RunAll-based TestMain (test_multi / test_multi_local), New
+// returns a view of the shared stack instead of starting a fresh one. This means
+// every existing integration test re-runs automatically against the full multi-plugin
+// stack with zero changes to the test files themselves.
 func New(t *testing.T, pluginModule, pluginDir string) *Suite {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping integration stack bootstrap in short mode")
+	}
+
+	// If RunAll already started a shared stack (test_multi context), reuse it.
+	// We don't start a new stack, and we don't register a Stop cleanup.
+	globalSuiteMu.Lock()
+	gs := globalSuite
+	globalSuiteMu.Unlock()
+	if gs != nil {
+		return gs.withT(t)
 	}
 
 	buildInfra(t)
@@ -169,7 +218,7 @@ func New(t *testing.T, pluginModule, pluginDir string) *Suite {
 	writeManifest(t, dir, "gateway")
 
 	env := filterEnv(os.Environ(), func(k string) bool {
-		return !strings.HasPrefix(k, "LAUNCHER_")
+		return !strings.HasPrefix(k, "LAUNCHER_") || k == "LAUNCHER_PLUGIN_CONFIG_ROOT"
 	})
 	env = append(env,
 		"LAUNCHER_PREBUILT=true",
@@ -191,8 +240,10 @@ func New(t *testing.T, pluginModule, pluginDir string) *Suite {
 
 // PluginSpec identifies a plugin binary to build and include in a multi-plugin stack.
 type PluginSpec struct {
-	Module string // Go module path, e.g. "github.com/slidebolt/plugin-test-clean"
-	Dir    string // Directory containing go.mod; pass "." from inside the plugin directory
+	Module   string            // Go module path, e.g. "github.com/slidebolt/plugin-test-clean"
+	Dir      string            // Directory containing go.mod; pass "." from inside the plugin directory
+	EnvFiles []string          // Optional env files resolved relative to Dir unless absolute
+	Env      map[string]string // Optional explicit env overrides for this plugin's stack context
 }
 
 // NewMulti is like New but boots multiple plugins in the same stack.
@@ -243,8 +294,12 @@ func NewMulti(t *testing.T, primary PluginSpec, extras ...PluginSpec) *Suite {
 	writeManifest(t, dir, "gateway")
 
 	env := filterEnv(os.Environ(), func(k string) bool {
-		return !strings.HasPrefix(k, "LAUNCHER_")
+		return !strings.HasPrefix(k, "LAUNCHER_") || k == "LAUNCHER_PLUGIN_CONFIG_ROOT"
 	})
+	env, err = mergePluginSpecEnv(env, allSpecs)
+	if err != nil {
+		t.Fatalf("integrationtesting: %v", err)
+	}
 	env = append(env,
 		"LAUNCHER_PREBUILT=true",
 		"LAUNCHER_API_PORT=0",
@@ -265,7 +320,7 @@ func NewMulti(t *testing.T, primary PluginSpec, extras ...PluginSpec) *Suite {
 func (s *Suite) start() {
 	logFile, err := os.Create(filepath.Join(s.dir, "launcher.log"))
 	if err != nil {
-		s.t.Fatalf("integrationtesting: create launcher log: %v", err)
+		s.fatal("integrationtesting: create launcher log: %v", err)
 	}
 	cmd := exec.Command(infraLC, "up")
 	cmd.Dir = s.dir
@@ -274,7 +329,7 @@ func (s *Suite) start() {
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		s.t.Fatalf("integrationtesting: start launcher: %v", err)
+		s.fatal("integrationtesting: start launcher: %v", err)
 	}
 	s.logFile = logFile
 	s.cmd = cmd
@@ -283,18 +338,34 @@ func (s *Suite) start() {
 func (s *Suite) waitForRuntime() {
 	runtimePath := filepath.Join(s.dir, ".build", "runtime.json")
 	if !waitForFile(runtimePath, 30*time.Second) {
-		dumpLog(s.t, filepath.Join(s.dir, "launcher.log"))
-		dumpLog(s.t, filepath.Join(s.logDir, "plugin-test-flaky.log"))
+		s.dumpLogs()
 		s.stop(false)
-		s.t.Fatalf("integrationtesting: runtime.json not written within 30s (stack failed to start)")
+		s.fatal("integrationtesting: runtime.json not written within 30s (stack failed to start)")
 	}
 	rt, err := readRuntime(runtimePath)
 	if err != nil {
 		s.stop(false)
-		s.t.Fatalf("integrationtesting: read runtime.json: %v", err)
+		s.fatal("integrationtesting: read runtime.json: %v", err)
 	}
 	s.apiURL = rt.APIBaseURL
 	s.natsURL = rt.NATSURL
+}
+
+// fatal calls t.Fatalf when running under a test, or log.Fatalf otherwise (RunAll context).
+func (s *Suite) fatal(format string, args ...any) {
+	if s.t != nil {
+		s.t.Helper()
+		s.t.Fatalf(format, args...)
+	} else {
+		log.Fatalf(format, args...)
+	}
+}
+
+func (s *Suite) dumpLogs() {
+	if s.t != nil {
+		dumpLog(s.t, filepath.Join(s.dir, "launcher.log"))
+		dumpLog(s.t, filepath.Join(s.logDir, "plugin-test-flaky.log"))
+	}
 }
 
 func (s *Suite) stop(removeDir bool) {
@@ -344,30 +415,126 @@ func (s *Suite) Stop() {
 	s.stop(true)
 }
 
+// --- RunAll / Suite — full-stack shared test environment ---
+
+// RunAll builds all listed plugins, starts one shared stack, runs all tests via
+// m.Run(), tears down, then calls os.Exit. Call from TestMain when using the
+// test_multi build tag. After RunAll starts the stack, tests call Suite(t) to
+// get the running environment.
+func RunAll(m *testing.M, plugins []PluginSpec) {
+	if err := buildInfraE(); err != nil {
+		log.Fatalf("integrationtesting RunAll: %v", err)
+	}
+
+	dir, err := os.MkdirTemp("", "sdk-integration-testing-run-*")
+	if err != nil {
+		log.Fatalf("integrationtesting RunAll: create run dir: %v", err)
+	}
+
+	binDir := filepath.Join(dir, ".build", "bin")
+	for _, sub := range []string{
+		binDir,
+		filepath.Join(dir, ".build", "pids"),
+		filepath.Join(dir, ".build", "logs"),
+		filepath.Join(dir, ".build", "data"),
+	} {
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			log.Fatalf("integrationtesting RunAll: mkdir: %v", err)
+		}
+	}
+
+	// Copy gateway binary.
+	if err := copyBinE(infraGW, filepath.Join(binDir, "gateway")); err != nil {
+		log.Fatalf("integrationtesting RunAll: %v", err)
+	}
+
+	// Build and copy every plugin.
+	for _, spec := range plugins {
+		bin, err := buildPluginE(spec.Module, spec.Dir)
+		if err != nil {
+			log.Fatalf("integrationtesting RunAll: %v", err)
+		}
+		if err := copyBinE(bin, filepath.Join(binDir, filepath.Base(spec.Module))); err != nil {
+			log.Fatalf("integrationtesting RunAll: %v", err)
+		}
+	}
+
+	// Write manifest listing only the gateway (plugins are auto-discovered by launcher).
+	writeManifestFatal(dir, "gateway")
+
+	env := filterEnv(os.Environ(), func(k string) bool {
+		return !strings.HasPrefix(k, "LAUNCHER_") || k == "LAUNCHER_PLUGIN_CONFIG_ROOT"
+	})
+	env, err = mergePluginSpecEnv(env, plugins)
+	if err != nil {
+		log.Fatalf("integrationtesting RunAll: %v", err)
+	}
+	env = append(env,
+		"LAUNCHER_PREBUILT=true",
+		"LAUNCHER_API_PORT=0",
+		"LAUNCHER_NATS_PORT=0",
+		"LAUNCHER_BUILD_DIR="+filepath.Join(dir, ".build"),
+	)
+
+	logDir := filepath.Join(dir, ".build", "logs")
+	s := &Suite{dir: dir, logDir: logDir, env: env} // no t — RunAll context
+	s.start()
+	s.waitForRuntime()
+
+	globalSuiteMu.Lock()
+	globalSuite = s
+	globalSuiteMu.Unlock()
+
+	code := m.Run()
+	s.Stop()
+	os.Exit(code)
+}
+
+// GetSuite returns the shared stack started by RunAll.
+// Must be called after RunAll has been set up in TestMain.
+// Panics with a clear message if RunAll was not called.
+func GetSuite(t *testing.T) *Suite {
+	t.Helper()
+	globalSuiteMu.Lock()
+	s := globalSuite
+	globalSuiteMu.Unlock()
+	if s == nil {
+		panic("integrationtesting.Suite called without integrationtesting.RunAll in TestMain")
+	}
+	return s
+}
+
 // --- Plugin assertions ---
 
 // RequirePlugin waits for pluginID to register with the gateway and become healthy.
 // Fails (not skips) the test if it doesn't happen in time.
 func (s *Suite) RequirePlugin(id string) {
-	s.t.Helper()
+	if s.t != nil {
+		s.t.Helper()
+	}
 	if !s.WaitFor(30*time.Second, func() bool { return s.isRegistered(id) }) {
-		dumpLog(s.t, filepath.Join(s.dir, "launcher.log"))
-		dumpLog(s.t, filepath.Join(s.logDir, id+".log"))
-		s.t.Fatalf("integrationtesting: plugin %q did not register within 30s", id)
+		if s.t != nil {
+			dumpLog(s.t, filepath.Join(s.dir, "launcher.log"))
+			dumpLog(s.t, filepath.Join(s.logDir, id+".log"))
+		}
+		s.fatal("integrationtesting: plugin %q did not register within 30s", id)
 	}
 	if !s.WaitFor(15*time.Second, func() bool { return s.isHealthy(id) }) {
-		dumpLog(s.t, filepath.Join(s.dir, "launcher.log"))
-		dumpLog(s.t, filepath.Join(s.logDir, id+".log"))
-		s.t.Fatalf("integrationtesting: plugin %q not healthy within 15s of registration", id)
+		if s.t != nil {
+			dumpLog(s.t, filepath.Join(s.dir, "launcher.log"))
+			dumpLog(s.t, filepath.Join(s.logDir, id+".log"))
+		}
+		s.fatal("integrationtesting: plugin %q not healthy within 15s of registration", id)
 	}
 }
 
-// SkipUnlessPlugin is like RequirePlugin but skips instead of failing.
-// Use for tests that depend on hardware or optional configuration.
-func (s *Suite) SkipUnlessPlugin(id string) {
-	s.t.Helper()
+// SkipUnlessPlugin is like RequirePlugin but skips the test instead of failing
+// when the plugin doesn't register. Use for plugins that require hardware or
+// optional external services (e.g. MQTT broker, cameras).
+func (s *Suite) SkipUnlessPlugin(t *testing.T, id string) {
+	t.Helper()
 	if !s.WaitFor(20*time.Second, func() bool { return s.isRegistered(id) }) {
-		s.t.Skipf("integrationtesting: plugin %q not registered; skipping", id)
+		t.Skipf("integrationtesting: plugin %q not registered; skipping (hardware not available)", id)
 	}
 }
 
@@ -552,17 +719,36 @@ func readRuntime(path string) (runtimeDescriptor, error) {
 
 func copyBin(t *testing.T, src, dst string) {
 	t.Helper()
+	if err := copyBinE(src, dst); err != nil {
+		t.Fatalf("integrationtesting: %v", err)
+	}
+}
+
+func copyBinE(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
-		t.Fatalf("integrationtesting: read binary %s: %v", src, err)
+		return fmt.Errorf("read binary %s: %w", src, err)
 	}
 	if err := os.WriteFile(dst, data, 0o755); err != nil {
-		t.Fatalf("integrationtesting: write binary %s: %v", dst, err)
+		return fmt.Errorf("write binary %s: %w", dst, err)
 	}
+	return nil
 }
 
 func writeManifest(t *testing.T, dir string, binaries ...string) {
 	t.Helper()
+	if err := writeManifestE(dir, binaries...); err != nil {
+		t.Fatalf("integrationtesting: %v", err)
+	}
+}
+
+func writeManifestFatal(dir string, binaries ...string) {
+	if err := writeManifestE(dir, binaries...); err != nil {
+		log.Fatalf("integrationtesting: %v", err)
+	}
+}
+
+func writeManifestE(dir string, binaries ...string) error {
 	type entry struct {
 		ID     string `json:"id"`
 		Binary string `json:"binary"`
@@ -573,8 +759,9 @@ func writeManifest(t *testing.T, dir string, binaries ...string) {
 	}
 	data, _ := json.MarshalIndent(entries, "", "  ")
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o644); err != nil {
-		t.Fatalf("integrationtesting: write manifest: %v", err)
+		return fmt.Errorf("write manifest: %w", err)
 	}
+	return nil
 }
 
 func filterEnv(env []string, keep func(string) bool) []string {
@@ -598,6 +785,98 @@ func firstEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func mergePluginSpecEnv(base []string, specs []PluginSpec) ([]string, error) {
+	merged := envSliceToMap(base)
+	for _, spec := range specs {
+		for _, file := range spec.EnvFiles {
+			path := file
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(spec.Dir, file)
+			}
+			values, err := parseEnvFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("load env for %s from %s: %w", spec.Module, path, err)
+			}
+			for k, v := range values {
+				merged[k] = v
+			}
+		}
+		for k, v := range spec.Env {
+			merged[k] = v
+		}
+	}
+	return envMapToSlice(merged), nil
+}
+
+func parseEnvFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	values := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("line %d: expected KEY=VALUE", lineNo)
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" {
+			return nil, fmt.Errorf("line %d: empty key", lineNo)
+		}
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
+				unquoted, err := strconv.Unquote(`"` + strings.ReplaceAll(value[1:len(value)-1], `"`, `\"`) + `"`)
+				if err == nil {
+					value = unquoted
+				} else {
+					value = value[1 : len(value)-1]
+				}
+			}
+		}
+		values[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func envSliceToMap(env []string) map[string]string {
+	out := make(map[string]string, len(env))
+	for _, kv := range env {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func envMapToSlice(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
 }
 
 func dumpLog(t *testing.T, path string) {

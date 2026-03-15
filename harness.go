@@ -316,7 +316,6 @@ func NewMulti(t *testing.T, primary PluginSpec, extras ...PluginSpec) *Suite {
 	return s
 }
 
-
 func (s *Suite) start() {
 	logFile, err := os.Create(filepath.Join(s.dir, "launcher.log"))
 	if err != nil {
